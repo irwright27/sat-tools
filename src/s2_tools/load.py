@@ -4,6 +4,17 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 from datetime import timezone
 from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
+from pathlib import Path
+from hashlib import sha256
+from http.client import IncompleteRead
+from contextlib import suppress
+import os
+import tempfile
+import time
+import warnings
+import planetary_computer
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -49,7 +60,11 @@ def load_s2(
         and declared NoData are masked before decoding. Negative reflectance
         is retained; no clipping. SCL and other nonspectral variables are unchanged.
         XML metadata may require small synchronous network reads; image arrays
-        remain lazy. Conflicting calibration within a fused timestamp is rejected.
+        remain lazy. Metadata downloads retry transient failures up to three times
+        and persist in ~/.cache/s2-tools/metadata (override the root with
+        S2_TOOLS_CACHE_DIR). Known Planetary Computer Sentinel-2 metadata URLs
+        are re-signed on HTTP 403. Conflicting calibration within a fused timestamp
+        is rejected.
 
     Returns
     -------
@@ -97,6 +112,76 @@ def _timestamp(value):
     return np.datetime64(value.astimezone(timezone.utc).replace(tzinfo=None), "ns")
 
 
+def _metadata_xml(href, item_id):
+    """Fetch immutable product XML with a disk cache and bounded retries."""
+    url = urlsplit(href)
+    # Only strip credentials for the known Planetary Computer Sentinel-2 store.
+    pc_asset = (url.scheme == "https" and
+                (url.hostname or "").startswith("sentinel2l2a") and
+                (url.hostname or "").endswith(".blob.core.windows.net"))
+    identity = urlunsplit(url._replace(query="", fragment="")) if pc_asset else href
+    cache_dir = Path(os.environ.get(
+        "S2_TOOLS_CACHE_DIR", str(Path.home() / ".cache" / "s2-tools"))) / "metadata"
+    path = cache_dir / (sha256(identity.encode()).hexdigest() + ".xml")
+    try:
+        return ET.fromstring(path.read_bytes())
+    except (OSError, ET.ParseError):
+        pass
+
+    failure = "unknown error"
+    for attempt in range(4):
+        try:
+            with urlopen(href, timeout=60) as response:
+                data = response.read()
+            root = ET.fromstring(data)
+            break
+        except HTTPError as exc:
+            failure = f"HTTP {exc.code}"
+            exc.close()
+            if exc.code == 403 and pc_asset and attempt < 3:
+                # sign() preserves existing signatures: remove the old one first.
+                try:
+                    href = planetary_computer.sign(identity)
+                except Exception:
+                    raise RuntimeError(
+                        f"{item_id}: could not refresh metadata credentials for {url.hostname}"
+                    ) from None
+            elif exc.code not in {408, 429, 500, 502, 503, 504}:
+                raise RuntimeError(
+                    f"{item_id}: metadata download failed from {url.hostname}: {failure}"
+                ) from None
+        except (URLError, TimeoutError, ConnectionError, IncompleteRead) as exc:
+            failure = type(exc).__name__
+        if attempt < 3:
+            warnings.warn(
+                f"{item_id}: metadata request failed ({failure}); retry {attempt + 1}/3",
+                RuntimeWarning, stacklevel=2,
+            )
+            time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(
+            f"{item_id}: metadata download failed from {url.hostname} after 4 attempts "
+            f"({failure}). Successfully downloaded metadata remains cached; rerun to resume."
+        ) from None
+
+    # Atomic replacement prevents another process reading a partial cache entry.
+    temporary = None
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=cache_dir, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(data)
+        temporary.replace(path)
+    except OSError:
+        warnings.warn("Could not persist Sentinel-2 metadata cache", RuntimeWarning,
+                      stacklevel=2)
+    finally:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+    return root
+
+
 def _xml_encoding(item, band, cache):
     if item.collection_id != "sentinel-2-l2a":
         raise ValueError("XML fallback requires the sentinel-2-l2a collection")
@@ -104,8 +189,7 @@ def _xml_encoding(item, band, cache):
     if asset is None:
         raise ValueError(f"{item.id}: no calibration or product-metadata XML")
     if asset.href not in cache:
-        with urlopen(asset.href, timeout=60) as response:
-            cache[asset.href] = ET.fromstring(response.read())
+        cache[asset.href] = _metadata_xml(asset.href, item.id)
     root = cache[asset.href]
     def elements(tag):
         return [e for e in root.iter() if e.tag.rsplit("}", 1)[-1] == tag]
