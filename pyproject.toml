@@ -19,6 +19,8 @@ dependencies = [
     "scipy",
     "rasterio",
     "xarray",
+    "h5netcdf>=1.8.1",
+    "h5py>=3.16.0",
     "matplotlib",
     "pystac-client>=0.9.0",
     "planetary-computer>=1.0.0",

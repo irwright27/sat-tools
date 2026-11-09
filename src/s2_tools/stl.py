@@ -5,6 +5,7 @@ from numbers import Integral
 
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 from statsmodels.tsa.seasonal import STL
 
 
@@ -131,6 +132,59 @@ def prepare_daily_series(
     return out
 
 
+def smooth_daily_series(
+    series: pd.Series,
+    window_days: int = 31,
+    polyorder: int = 2,
+) -> pd.Series:
+    """Smooth a complete daily series with a Savitzky–Golay filter.
+
+    Defaults to a 31-day quadratic fit. Prepare and gap-fill irregular
+    observations with ``prepare_daily_series`` first. The window must be odd,
+    longer than the polynomial order, and no longer than the series.
+
+    Returns a new Series preserving its name, dates, and existing metadata;
+    ``attrs['smoothing']`` records the filter settings. Values are not clipped.
+    Edge values use polynomial fits (``mode='interp'``). Inspect endpoints,
+    long interpolated gaps, and peak attenuation when choosing a window.
+    Keep the original observations separately: downstream partition residuals
+    are relative to this smoothed input.
+    """
+    if not isinstance(series, pd.Series):
+        raise TypeError("series must be a pandas Series.")
+    if not isinstance(series.index, pd.DatetimeIndex):
+        raise TypeError("series index must be a pandas DatetimeIndex.")
+    if series.empty:
+        raise ValueError("series is empty.")
+    if series.index.hasnans or not series.index.is_unique:
+        raise ValueError("series index must contain unique dates without NaT.")
+    expected = pd.date_range(series.index[0], periods=len(series), freq="1D")
+    if (not series.index.equals(expected)
+            or not series.index.equals(series.index.normalize())):
+        raise ValueError("series must have an increasing, complete daily index at midnight.")
+    values = series.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("Prepare/gap-fill the series before smoothing; values must be finite.")
+    _validate_integer(window_days, "window_days", 1)
+    _validate_integer(polyorder, "polyorder", 0)
+    if window_days % 2 == 0:
+        raise ValueError("window_days must be odd.")
+    if polyorder >= window_days:
+        raise ValueError("polyorder must be less than window_days.")
+    if window_days > len(series):
+        raise ValueError("window_days must not exceed the series length.")
+
+    out = series.astype(float).copy(deep=True)
+    out.iloc[:] = savgol_filter(values, window_days, polyorder, mode="interp")
+    out.attrs["smoothing"] = {
+        "method": "savgol",
+        "window_days": int(window_days),
+        "polyorder": int(polyorder),
+        "mode": "interp",
+    }
+    return out
+
+
 def decompose_stl(
     series: pd.Series,
     ns: int = DEFAULT_NS,
@@ -142,7 +196,8 @@ def decompose_stl(
     Decompose a complete daily VI series into STL components.
 
     Gap filling is intentionally kept separate. Use :func:`prepare_daily_series`
-    first when working from irregular Sentinel-2 observations.
+    first when working from irregular Sentinel-2 observations. Optionally call
+    :func:`smooth_daily_series` next; no smoothing is applied implicitly.
 
     Returns
     -------
@@ -203,5 +258,6 @@ def decompose_stl(
         index=series.index,
     )
 
+    out.attrs.update(series.attrs)
     out.attrs["stl_parameters"] = params
     return out
